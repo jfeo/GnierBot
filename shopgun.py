@@ -2,6 +2,7 @@ import requests
 import json
 import hashlib
 
+from datetime import datetime, timedelta
 from dateutil.parser import isoparse
 
 from config import SHOPGUN_API_KEY as api_key, SHOPGUN_API_SECRET as api_secret
@@ -25,12 +26,16 @@ class Session(object):
         else:
             raise Exception("Kunne ikke starte session.")
 
-    def search(self, query, lat=None, lon=None, radius=None):
+    def search(self, query, lat=None, lon=None, radius=None, limit=None, offset=None):
         params = {
             "_token": self.token,
             "_signature": self.signature,
             "query": query
         }
+        if limit is not None:
+            params["limit"] = limit
+        if offset is not None:
+            params["offset"] = offset
         if lat is not None:
             params["r_lat"] = lat
         if lon is not None:
@@ -45,6 +50,17 @@ class Session(object):
         for item in response.json():
             yield Offer(item)
 
+    def search_all(self, query, lat=None, lon=None, radius=None):
+        contd = True
+        offset = 0
+        while contd:
+            before = offset
+            for offer in self.search(query, lat, lon, radius, limit=100,
+                                     offset=offset):
+                offset += 1
+                yield offer
+            contd = offset - before == 100
+
 
 class Offer(object):
 
@@ -56,6 +72,28 @@ class Offer(object):
             item['run_till']) if 'run_till' in item else None
         self.run_from = isoparse(
             item['run_from']) if'run_from' in item else None
-        self.pricing = item.get('pricing')
+        self.price = item.get('pricing').get('price')
         self.quantity = item.get('quantity')
         self.store = item['branding']['name']
+        self.images = item.get('images')
+
+    def timeleft(self):
+        """Get the time left on the offer."""
+        if not self.run_till:
+            return None
+
+        return self.run_till - datetime.now(self.run_till.tzinfo)
+
+    def expiring(self):
+        """Is the offer expiring soon?"""
+        timeleft = self.timeleft()
+        if not timeleft:
+            return None
+        return timeleft < timedelta(days=2)
+
+    def expired(self):
+        """Is the offer expired?"""
+        timeleft = self.timeleft()
+        if not timeleft:
+            return None
+        return timeleft < timedelta(seconds=0)
