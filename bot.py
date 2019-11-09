@@ -1,5 +1,6 @@
 import logging
-from telegram.ext import Updater, ConversationHandler, CommandHandler, MessageHandler, CallbackQueryHandler, Filters
+from telegram.ext import Updater, ConversationHandler, CommandHandler
+from telegram.ext import MessageHandler, CallbackQueryHandler, Filters
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from shopgun import Session
@@ -7,9 +8,9 @@ from config import TELEGRAM_TOKEN, DEFAULT_LOCATION, DEFAULT_RADIUS
 from datetime import datetime, timedelta
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-LOGGER = logging.getLogger('gnier'),
+LOGGER = logging.getLogger('gnier')
 
 CHATS = {}
 
@@ -133,31 +134,38 @@ class Chat:
             sub.update(self, func_new=new, func_expired=expired,
                        func_expiring=expiring)
 
+        CommandHandler('indstil', 'settings_convo_entry')
+
 
 # Conversation state identifies for search conversation
 SEARCH_ASK_QUERY, SEARCH_ASK_PRICE, SEARCH_SHOW_RESULT = range(3)
 SEARCH_DONE, SEARCH_COMMAND, SEARCH_REMOVE = range(3, 6)
 
-# Converation state identifiers for settings conversation
-SETTINGS_ASK_LOCATION, SETTINGS_ASK_RADIUS, SETTINGS_DONE = range(3)
+# Conversation state identifiers for settings conversation
+SETTINGS_VIEW_SAVE, SETTINGS_ASK, SETTINGS_DONE = range(3)
 
 
 def start(update, context):
     """Start command."""
     lines = (
-        'Vær hilset!!',
+        'Vær hilset!',
         'En krone sparet er en krone tjent. Og nu skal der tjenes!',
         '',
         'Med mine evner, og din sparsommelighed kan vi sammen gøre store '
         'ting. Jeg forstår følgende kommandoer der kan hjælpe dig: '
         '',
-        '/menu - en menu med muligheder',
-        '/ny - 🌟 lav en ny søgning',
-        '/slet - slet en af dine søgninger',
-        '/liste - få en liste over dine søgninger',
-        '/tilbud - få en liste over dine tilbud'
+        ' ℹ /menu - en menu med muligheder',
+        ' 🌟 /ny - lav en ny søgning',
+        ' 🗑 /slet - slet en af dine søgninger',
+        ' 📃 /liste - få en liste over dine søgninger',
+        ' 💰 /tilbud - få en liste over dine tilbud',
+        ' ✍️ /indstil- for at ændre placering eller radius på søgninger'
     )
     update.message.reply_text('\n'.join(lines))
+
+    # initialize user data
+    chat = Chat.get(update.message.chat_id)
+    chat.schedule(context, timedelta(hours=6))
 
 
 def search_convo_entry(update, context):
@@ -394,6 +402,79 @@ def offers_list(update, context):
         update.message.reply_text('\n'.join(lines))
 
 
+def settings_convo_view_save(update, context):
+    """Save location setting."""
+    chat = Chat.get(update.message.chat_id)
+    if update.message.location:
+        user_location = update.message.location
+        chat.lon = user_location.longitude
+        chat.lan = user_location.latitude
+
+    if update.message.text:
+        try:
+            chat.radius = int(update.message.text)
+        except ValueError:
+            pass
+
+    keyboard = [[
+        InlineKeyboardButton('Opdater radius', callback_data='radius'),
+        InlineKeyboardButton('Opdater lokation', callback_data='location'),
+        InlineKeyboardButton('Færdig', callback_data='done')
+    ]]
+    markup = InlineKeyboardMarkup(keyboard)
+
+    update.message.reply_text('\n'.join([
+        f'Dine indstillinger er:',
+        '',
+        f'🌍 {chat.lat}, {chat.lon}',
+        f'⭕ {chat.radius}'
+    ]), reply_markup=markup)
+
+    return SETTINGS_ASK
+
+
+def settings_convo_ask_location(update, context):
+    """Ask user for location."""
+    query = update.callback_query
+    bot = context.bot
+
+    bot.edit_message_text(
+        text=f'Hvilken placering vil du søge ud fra?',
+        chat_id=query.message.chat_id,
+        message_id=query.message.message_id
+    )
+
+    return SETTINGS_VIEW_SAVE
+
+
+def settings_convo_ask_radius(update, context):
+    """Ask user for radius"""
+    query = update.callback_query
+    bot = context.bot
+
+    bot.edit_message_text(
+        text=f'Hvilken radius vil du søge indenfor (i meter)?',
+        chat_id=query.message.chat_id,
+        message_id=query.message.message_id
+    )
+
+    return SETTINGS_VIEW_SAVE
+
+
+def settings_convo_done(update, context):
+    """End settings conversation."""
+    query = update.callback_query
+    bot = context.bot
+
+    bot.edit_message_text(
+        text='Godt, godt.',
+        chat_id=query.message.chat_id,
+        message_id=query.message.message_id
+    )
+
+    return ConversationHandler.END
+
+
 def main():
     """Run bot."""
     updater = Updater(TELEGRAM_TOKEN, use_context=True)
@@ -403,16 +484,35 @@ def main():
 
     # conversation for changing user settings
     settings_convo = ConversationHandler(
-        entry_points=[],
+        entry_points=[
+            CommandHandler('indstil', settings_convo_view_save)
+        ],
 
         states={
-            SETTINGS_ASK_LOCATION: [
+            SETTINGS_VIEW_SAVE: [
+                MessageHandler(Filters.location, settings_convo_view_save),
+                MessageHandler(Filters.regex(
+                    r'^[0-9]+$'), settings_convo_view_save),
             ],
-            SETTINGS_ASK_RADIUS: [],
-            SETTINGS_DONE: []
+            SETTINGS_ASK: [
+                CallbackQueryHandler(
+                    settings_convo_ask_location, pattern=r'^location$'
+                ),
+                CallbackQueryHandler(
+                    settings_convo_ask_radius, pattern=r'radius'
+                ),
+                CallbackQueryHandler(
+                    settings_convo_done, pattern=r'done'
+                )
+            ],
+            SETTINGS_DONE: [
+                MessageHandler(Filters.text, settings_convo_done)
+            ]
         },
 
-        fallbacks=[]
+        fallbacks=[
+            MessageHandler(Filters.text, settings_convo_done)
+        ]
     )
     disp.add_handler(settings_convo)
 
