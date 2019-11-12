@@ -1,11 +1,13 @@
+"""A telegram bot"""
+
 import logging
+
 from telegram.ext import Updater, ConversationHandler, CommandHandler
 from telegram.ext import MessageHandler, CallbackQueryHandler, Filters
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from shopgun import Session
 from config import TELEGRAM_TOKEN, DEFAULT_LOCATION, DEFAULT_RADIUS
-from datetime import datetime, timedelta
 
 logging.basicConfig(
     level=logging.INFO,
