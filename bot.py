@@ -7,7 +7,10 @@ from telegram.ext import MessageHandler, CallbackQueryHandler, Filters
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from shopgun import Session
+from cart import Cart, Subscription
 from config import TELEGRAM_TOKEN, DEFAULT_LOCATION, DEFAULT_RADIUS
+
+from datetime import timedelta
 
 logging.basicConfig(
     level=logging.INFO,
@@ -17,15 +20,39 @@ LOGGER = logging.getLogger('gnier')
 CHATS = {}
 
 
-def human_timedelta(timedelta):
+def offer_text(offer):
+    """Standard text for an offer."""
+    icon = '💰'
+    if offer.expiring():
+        icon = '⌛'
+    if offer.expired():
+        icon = '☠️'
+
+    return (f'{icon} {offer.store} tilbyder "{offer.heading}" til '
+            f'{offer.price} kr.')
+
+
+def offer_text_expired(offer):
+    """Text for an expired offer."""
+    return f'❌ Tilbuddet "{offer.heading}" i {offer.store} er udløbet.'
+
+
+def offer_text_expiring(offer):
+    """Text for an expiring offer."""
+    return (f'⚠ {offer.store}s tilbud om️ "{offer.heading}" til '
+            f'{offer.price} kr. udløber '
+            f'{human_timedelta(offer.timeleft())}.')
+
+
+def human_timedelta(delta):
     """Return a string representing the time delta in a (danish) human readable
     format.
     """
-    seconds = timedelta.seconds % 60 if timedelta.seconds else 0
-    minutes = timedelta.seconds // 60 % 60 if timedelta.seconds else 0
-    hours = timedelta.seconds // 3600 % 24 if timedelta.seconds else 0
-    days = abs(timedelta.days) % 7 if timedelta.days else 0
-    weeks = abs(timedelta.days) // 7 if timedelta.days else 0
+    seconds = delta.seconds % 60 if delta.seconds else 0
+    minutes = delta.seconds // 60 % 60 if delta.seconds else 0
+    hours = delta.seconds // 3600 % 24 if delta.seconds else 0
+    days = abs(delta.days) % 7 if delta.days else 0
+    weeks = abs(delta.days) // 7 if delta.days else 0
     parts = []
 
     if weeks > 0:
@@ -46,49 +73,10 @@ def human_timedelta(timedelta):
         last = parts.pop()
         sentence = f'{", ".join(parts)}, og {last}'
 
-    if timedelta.days < 0:
+    if delta.days < 0:
         return f'for {sentence} siden'
 
     return f'om {sentence}'
-
-
-class Subscription:
-    """Stores a search that is subscribed."""
-
-    def __init__(self, query, price):
-        self.query = query
-        self.price = price
-        self.offers = []
-
-    def update(self, chat, func_new=None, func_expired=None,
-               func_expiring=None):
-        """Perform an update."""
-        session = Session()
-        found = {offer.ident: False for offer in self.offers}
-        remove = []
-
-        # get new offers
-        for offer in session.search(self.query, chat.lat, chat.lon, chat.radius):
-            if offer.ident in found:
-                found[offer.ident] = True
-                continue
-            if offer.price <= self.price:
-                self.offers.append(offer)
-                if func_new:
-                    func_new(offer)
-
-        # handle existing offers
-        for offer in self.offers:
-            if offer.expired():
-                remove.append(offer)
-                if func_expired:
-                    func_expired(offer)
-            elif offer.expiring():
-                if func_expiring:
-                    func_expiring(offer)
-
-        for offer in remove:
-            self.offers.remove(offer)
 
 
 class Chat:
@@ -96,8 +84,8 @@ class Chat:
 
     def __init__(self, chat_id):
         self.chat_id = chat_id
-        self.subs = []
         self.job = None
+        self.cart = Cart()
         self.radius = DEFAULT_RADIUS
         self.lat, self.lon = DEFAULT_LOCATION
 
@@ -115,28 +103,35 @@ class Chat:
         self.job = context.job_queue.run_repeating(
             self.update, interval, interval if first is None else first)
 
+    def add_subscription(self, query, price):
+        """Add a new subscription."""
+        session = Session()
+        sub = self.cart.add_subscription(query, price)
+        offers = session.search(query, price, self.lat, self.lon)
+        sub.handle_offers(offers)
+        sub.check_offers()
+
     def update(self, context):
         """Check each subscription for updates."""
-        def expiring(offer):
-            msg = (f'⚠ {offer.store}s tilbud om️ "{offer.heading}" til '
-                   f'{offer.price} kr. udløber '
-                   f'{human_timedelta(offer.timeleft())}.')
-            context.bot.send_message(self.chat_id, text=msg)
-
-        def expired(offer):
-            msg = f'❌ Tilbuddet "{offer.heading}" i {offer.store} er udløbet.'
-            context.bot.send_message(self.chat_id, text=msg)
-
-        def new(offer):
-            msg = (f'💰 {offer.store} tilbyder "{offer.heading}" til '
-                   f'{offer.price} kr.')
-            context.bot.send_message(self.chat_id, text=msg)
-
-        for sub in self.subs:
-            sub.update(self, func_new=new, func_expired=expired,
-                       func_expiring=expiring)
-
-        CommandHandler('indstil', 'settings_convo_entry')
+        session = Session()
+        for sub in self.cart:
+            offers = list(session.search(
+                sub.query, sub.price, self.lat, self.lon))
+            for offer in sub.handle_offers(offers):
+                context.bot.send_message(
+                    self.chat_id,
+                    text=offer_text(offer)
+                )
+            updates = sub.check_offers()
+            for offer in updates['expired']:
+                context.bot.send_message(
+                    self.chat_id,
+                    text=offer_text_expired(offer))
+            for offer in updates['expiring']:
+                context.bot_send_message(
+                    self.chat_id,
+                    text=offer_text_expiring(offer)
+                )
 
 
 # Conversation state identifies for search conversation
@@ -156,7 +151,6 @@ def start(update, context):
         'Med mine evner, og din sparsommelighed kan vi sammen gøre store '
         'ting. Jeg forstår følgende kommandoer der kan hjælpe dig: '
         '',
-        ' ℹ /menu - en menu med muligheder',
         ' 🌟 /ny - lav en ny søgning',
         ' 🗑 /slet - slet en af dine søgninger',
         ' 📃 /liste - få en liste over dine søgninger',
@@ -226,16 +220,7 @@ def search_convo_show_result(update, context):
             too_expensive += 1
             continue
 
-        icon = '💰'
-        if offer.expiring():
-            icon = '⌛'
-        if offer.expired():
-            icon = '☠️'
-
-        update.message.reply_text(
-            f'{icon} {offer.heading} i {offer.store} til {offer.price} kr. '
-            f'(udløber {human_timedelta(offer.timeleft())})'
-        )
+        update.message.reply_text(offer_text(offer))
 
     if total_offers == 0:
         update.message.reply_text(
@@ -271,9 +256,7 @@ def search_convo_save(update, context):
         text='👋 Den er i vinkel, du!'
     )
 
-    sub = Subscription(user_data['query'], user_data['price'])
-    sub.update(chat)
-    chat.subs.append(sub)
+    chat.add_subscription(user_data['query'], user_data['price'])
 
     return ConversationHandler.END
 
@@ -412,9 +395,16 @@ def settings_convo_view_save(update, context):
         chat.lon = user_location.longitude
         chat.lan = user_location.latitude
 
-    if update.message.text:
+    if update.message.text.isdigit():
+        chat.radius = int(update.message.text)
+    else:
         try:
-            chat.radius = int(update.message.text)
+            lat, lon = update.message.text.split(',')
+            lat = float(lat)
+            lon = float(lon)
+            if 90 <= lat <= 90 and -180 <= lon <= 180:
+                chat.lat = lat
+                chat.lon = lon
         except ValueError:
             pass
 
