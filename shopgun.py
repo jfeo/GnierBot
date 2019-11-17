@@ -78,7 +78,7 @@ class Offer:
     """Represents a single Offer, a result from an Offer search."""
 
     def __init__(self, item: dict):
-        self.ident = item.get('id')
+        self.offer_id = item.get('id')
         self.heading = item.get('heading')
         self.run_till = isoparse(
             item['run_till']) if 'run_till' in item else None
