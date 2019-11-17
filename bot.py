@@ -396,8 +396,7 @@ def offers_list(update, context):
         ]
         for offer in sub.offers:
             print(offer, offer.timeleft(), offer.run_till)
-            lines.append(f' 💰 {offer.heading} til {offer.price} kr. '
-                         f'(udløber {human_timedelta(offer.timeleft())})')
+            lines.append(offer_text(offer))
 
         update.message.reply_text('\n'.join(lines))
 
