@@ -1,13 +1,15 @@
 """A telegram bot"""
 
+import os
 import logging
+import json
 
 from telegram.ext import Updater, ConversationHandler, CommandHandler
 from telegram.ext import MessageHandler, CallbackQueryHandler, Filters
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from shopgun import Session
-from cart import Cart, Subscription
+from cart import Cart
 from config import TELEGRAM_TOKEN, DEFAULT_LOCATION, DEFAULT_RADIUS
 
 from datetime import timedelta
@@ -18,6 +20,7 @@ logging.basicConfig(
 LOGGER = logging.getLogger('gnier')
 
 CHATS = {}
+CONFIG = {'chats': {}}
 
 
 def offer_text(offer):
@@ -81,19 +84,19 @@ def human_timedelta(delta):
 
 class Chat:
     """User data, subscription storage, and update scheduling."""
-
-    def __init__(self, chat_id):
+    def __init__(self, chat_id, on_config_updated=None):
         self.chat_id = chat_id
         self.job = None
         self.cart = Cart()
         self.radius = DEFAULT_RADIUS
         self.lat, self.lon = DEFAULT_LOCATION
+        self.on_config_updated = on_config_updated
 
     @staticmethod
     def get(chat_id):
         """Get existing or created chat."""
         if chat_id not in CHATS:
-            CHATS[chat_id] = Chat(chat_id)
+            CHATS[chat_id] = Chat(chat_id, handle_chat_update)
         return CHATS[chat_id]
 
     def schedule(self, context, interval, first=None):
@@ -107,31 +110,58 @@ class Chat:
         """Add a new subscription."""
         session = Session()
         sub = self.cart.add_subscription(query, price)
-        offers = session.search(query, price, self.lat, self.lon)
-        sub.handle_offers(offers)
+        offers = session.search(query, self.lat, self.lon, self.radius)
+        list(sub.handle_offers(offers))
         sub.check_offers()
+        self.config_updated()
+
+    def remove_subscription(self, idx):
+        """Remove a subscription"""
+        if self.cart.subscriptions and 0 < idx < len(self.cart.subscriptions):
+            self.cart.remove_subscription(self.cart.subscriptions[idx])
+            self.config_updated()
 
     def update(self, context):
         """Check each subscription for updates."""
         session = Session()
+
         for sub in self.cart:
-            offers = list(session.search(
-                sub.query, sub.price, self.lat, self.lon))
+            offers = session.search(sub.query, self.lat, self.lon, self.radius)
             for offer in sub.handle_offers(offers):
-                context.bot.send_message(
-                    self.chat_id,
-                    text=offer_text(offer)
-                )
+                context.bot.send_message(self.chat_id, text=offer_text(offer))
+
             updates = sub.check_offers()
             for offer in updates['expired']:
-                context.bot.send_message(
-                    self.chat_id,
-                    text=offer_text_expired(offer))
+                context.bot.send_message(self.chat_id,
+                                         text=offer_text_expired(offer))
             for offer in updates['expiring']:
-                context.bot_send_message(
-                    self.chat_id,
-                    text=offer_text_expiring(offer)
-                )
+                context.bot_send_message(self.chat_id,
+                                         text=offer_text_expiring(offer))
+        self.config_updated()
+
+    def config_updated(self):
+        """Called when a part of the configuration might be changed."""
+        if callable(self.on_config_updated):
+            self.on_config_updated(self.config())
+
+    def config(self):
+        """Dump a representation of the Chat to JSON."""
+        return {
+            'chat_id':
+            self.chat_id,
+            'lat':
+            self.lat,
+            'lon':
+            self.lon,
+            'radius':
+            self.radius,
+            'subscriptions':
+            list(
+                map(lambda sub: {
+                    'query': sub.query,
+                    'price': sub.price
+                }, self.cart))
+        }
 
 
 # Conversation state identifies for search conversation
@@ -144,19 +174,15 @@ SETTINGS_VIEW_SAVE, SETTINGS_ASK, SETTINGS_DONE = range(3)
 
 def start(update, context):
     """Start command."""
-    lines = (
-        'Vær hilset!',
-        'En krone sparet er en krone tjent. Og nu skal der tjenes!',
-        '',
-        'Med mine evner, og din sparsommelighed kan vi sammen gøre store '
-        'ting. Jeg forstår følgende kommandoer der kan hjælpe dig: '
-        '',
-        ' 🌟 /ny - lav en ny søgning',
-        ' 🗑 /slet - slet en af dine søgninger',
-        ' 📃 /liste - få en liste over dine søgninger',
-        ' 💰 /tilbud - få en liste over dine tilbud',
-        ' ✍️ /indstil- for at ændre placering eller radius på søgninger'
-    )
+    lines = ('Vær hilset!',
+             'En krone sparet er en krone tjent. Og nu skal der tjenes!', '',
+             'Med mine evner, og din sparsommelighed kan vi sammen gøre store '
+             'ting. Jeg forstår følgende kommandoer der kan hjælpe dig: '
+             '', ' 🌟 /ny - lav en ny søgning',
+             ' 🗑 /slet - slet en af dine søgninger',
+             ' 📃 /liste - få en liste over dine søgninger',
+             ' 💰 /tilbud - få en liste over dine tilbud',
+             ' ✍️ /indstil- for at ændre placering eller radius på søgninger')
     update.message.reply_text('\n'.join(lines))
 
     # initialize user data
@@ -181,11 +207,9 @@ def search_convo_ask_query(update, context):
     if update.callback_query:
         query = update.callback_query
         bot = context.bot
-        bot.edit_message_text(
-            chat_id=query.message.chat_id,
-            message_id=query.message.message_id,
-            text='❓ Hvad vil du søge efter?'
-        )
+        bot.edit_message_text(chat_id=query.message.chat_id,
+                              message_id=query.message.message_id,
+                              text='❓ Hvad vil du søge efter?')
     else:
         update.message.reply_text('❓ Hvad vil du søge efter?')
     return SEARCH_ASK_PRICE
@@ -236,9 +260,7 @@ def search_convo_show_result(update, context):
     ]]
     markup = InlineKeyboardMarkup(keyboard)
 
-    update.message.reply_text(
-        '❓ Vil du gemme søgningen?', reply_markup=markup
-    )
+    update.message.reply_text('❓ Vil du gemme søgningen?', reply_markup=markup)
 
     return SEARCH_DONE
 
@@ -250,11 +272,9 @@ def search_convo_save(update, context):
     bot = context.bot
     user_data = context.user_data
 
-    bot.edit_message_text(
-        chat_id=chat.chat_id,
-        message_id=query.message.message_id,
-        text='👋 Den er i vinkel, du!'
-    )
+    bot.edit_message_text(chat_id=chat.chat_id,
+                          message_id=query.message.message_id,
+                          text='👋 Den er i vinkel, du!')
 
     chat.add_subscription(user_data['query'], user_data['price'])
 
@@ -265,11 +285,9 @@ def search_convo_done(update, context):
     """End search conversation."""
     query = update.callback_query
     bot = context.bot
-    bot.edit_message_text(
-        chat_id=query.message.chat_id,
-        message_id=query.message.message_id,
-        text='️👋 Det er godt du, hej!'
-    )
+    bot.edit_message_text(chat_id=query.message.chat_id,
+                          message_id=query.message.message_id,
+                          text='️👋 Det er godt du, hej!')
     return ConversationHandler.END
 
 
@@ -282,19 +300,19 @@ def search_convo_list(update, context):
     else:
         chat = Chat.get(update.message.chat_id)
 
-    if not chat.subs:
+    if not chat.cart.subscriptions:
         text = '⁉️ Du har ingen gemte søgninger.'
     else:
-        text = '\n'.join([f'{i}. {sub.query}' for i,
-                          sub in enumerate(chat.subs, start=1)])
+        text = '\n'.join([
+            f'🔎 {i}. {sub.query} ({sub.price} kr.)'
+            for i, sub in enumerate(chat.cart, start=1)
+        ])
         text = f'Her er dine søgninger:\n{text}'
 
     if update.callback_query:
-        bot.edit_message_text(
-            chat_id=chat.chat_id,
-            message_id=query.message.message_id,
-            text=text
-        )
+        bot.edit_message_text(chat_id=chat.chat_id,
+                              message_id=query.message.message_id,
+                              text=text)
     else:
         update.message.reply_text(text)
 
@@ -311,32 +329,30 @@ def search_convo_ask_remove(update, context):
         chat = Chat.get(update.message.chat_id)
 
     # No subscriptions
-    if not chat.subs:
+    if not chat.cart.subscriptions:
         text = '⁉️ Du har ingen søgninger at slette.'
         if update.callback_query:
-            bot.edit_message_text(
-                text, chat_id=chat.chat_id,
-                message_id=query.message.message_id
-            )
+            bot.edit_message_text(text,
+                                  chat_id=chat.chat_id,
+                                  message_id=query.message.message_id)
         else:
             update.message.reply_text(text)
         return ConversationHandler.END
 
     # Generate keyboard
     keyboard = [[InlineKeyboardButton(sub.query, callback_data=str(i))]
-                for i, sub in enumerate(chat.subs)]
-    keyboard.append([InlineKeyboardButton(
-        text='Annuller', callback_data='cancel')])
+                for i, sub in enumerate(chat.cart)]
+    keyboard.append(
+        [InlineKeyboardButton(text='Annuller', callback_data='cancel')])
     markup = InlineKeyboardMarkup(keyboard)
 
     # Reply
     text = 'Hvilken søgning vil du fjerne?'
     if update.callback_query:
-        bot.edit_message_text(
-            text, chat_id=chat.chat_id,
-            message_id=query.message.message_id,
-            reply_markup=markup
-        )
+        bot.edit_message_text(text,
+                              chat_id=chat.chat_id,
+                              message_id=query.message.message_id,
+                              reply_markup=markup)
     else:
         update.message.reply_text(text, reply_markup=markup)
 
@@ -349,14 +365,13 @@ def search_convo_remove(update, context):
     bot = context.bot
     chat = Chat.get(query.message.chat_id)
     sub_index = int(query.data)
-    removed_query = chat.subs[sub_index].query
-    del chat.subs[sub_index]
+    removed_query = chat.cart.subscriptions[sub_index].query
+    chat.remove_subscription(sub_index)
 
     bot.edit_message_text(
         text=f'🗑️ Søgningen efter "{removed_query}" er fjernet.',
         chat_id=chat.chat_id,
-        message_id=query.message.message_id
-    )
+        message_id=query.message.message_id)
 
     return ConversationHandler.END
 
@@ -365,11 +380,11 @@ def offers_list(update, context):
     """Show the currently found offers."""
     chat = Chat.get(update.message.chat_id)
 
-    if not chat.subs:
+    if not chat.cart.subscriptions:
         text = 'ℹ️ Du får ingen tilbud, hvis du ikke har nogen søgninger.'
         update.message.reply_text(text)
 
-    for sub in chat.subs:
+    for sub in chat.cart:
         if not sub.offers:
             text = f'ℹ️ Søgningen efter "{sub.query}" har ingen tilbud.'
             update.message.reply_text(text)
@@ -416,11 +431,10 @@ def settings_convo_view_save(update, context):
     markup = InlineKeyboardMarkup(keyboard)
 
     update.message.reply_text('\n'.join([
-        f'Dine indstillinger er:',
-        '',
-        f'🌍 {chat.lat}, {chat.lon}',
+        f'Dine indstillinger er:', '', f'🌍 {chat.lat}, {chat.lon}',
         f'⭕ {chat.radius}'
-    ]), reply_markup=markup)
+    ]),
+                              reply_markup=markup)
 
     return SETTINGS_ASK
 
@@ -430,11 +444,9 @@ def settings_convo_ask_location(update, context):
     query = update.callback_query
     bot = context.bot
 
-    bot.edit_message_text(
-        text=f'Hvilken placering vil du søge ud fra?',
-        chat_id=query.message.chat_id,
-        message_id=query.message.message_id
-    )
+    bot.edit_message_text(text=f'Hvilken placering vil du søge ud fra?',
+                          chat_id=query.message.chat_id,
+                          message_id=query.message.message_id)
 
     return SETTINGS_VIEW_SAVE
 
@@ -447,8 +459,7 @@ def settings_convo_ask_radius(update, context):
     bot.edit_message_text(
         text=f'Hvilken radius vil du søge indenfor (i meter)?',
         chat_id=query.message.chat_id,
-        message_id=query.message.message_id
-    )
+        message_id=query.message.message_id)
 
     return SETTINGS_VIEW_SAVE
 
@@ -458,17 +469,34 @@ def settings_convo_done(update, context):
     query = update.callback_query
     bot = context.bot
 
-    bot.edit_message_text(
-        text='Godt, godt.',
-        chat_id=query.message.chat_id,
-        message_id=query.message.message_id
-    )
+    bot.edit_message_text(text='Godt, godt.',
+                          chat_id=query.message.chat_id,
+                          message_id=query.message.message_id)
 
     return ConversationHandler.END
 
 
+def handle_chat_update(chat_db):
+    """Save configuration."""
+    CONFIG['chats'][str(chat_db['chat_id'])] = chat_db
+    with open('GnierDB.json', 'w') as db_file:
+        json.dump(CONFIG, db_file)
+
+
 def main():
     """Run bot."""
+    if os.path.isfile('GnierDB.json'):
+        with open('GnierDB.json', 'r') as db_file:
+            database = json.load(db_file)
+            for chat_id in database['chats']:
+                chat_data = database['chats'][chat_id]
+                chat = Chat.get(chat_data['chat_id'])
+                chat.lat = chat_data['lat']
+                chat.on = chat_data['lon']
+                chat.radius = chat_data['radius']
+                for sub in chat_data['subscriptions']:
+                    chat.add_subscription(sub['query'], sub['price'])
+
     updater = Updater(TELEGRAM_TOKEN, use_context=True)
     disp = updater.dispatcher
     disp.add_handler(CommandHandler("start", start))
@@ -476,36 +504,23 @@ def main():
 
     # conversation for changing user settings
     settings_convo = ConversationHandler(
-        entry_points=[
-            CommandHandler('indstil', settings_convo_view_save)
-        ],
-
+        entry_points=[CommandHandler('indstil', settings_convo_view_save)],
         states={
             SETTINGS_VIEW_SAVE: [
                 MessageHandler(Filters.location, settings_convo_view_save),
-                MessageHandler(Filters.regex(
-                    r'^[0-9]+$'), settings_convo_view_save),
+                MessageHandler(Filters.regex(r'^[0-9]+$'),
+                               settings_convo_view_save),
             ],
             SETTINGS_ASK: [
-                CallbackQueryHandler(
-                    settings_convo_ask_location, pattern=r'^location$'
-                ),
-                CallbackQueryHandler(
-                    settings_convo_ask_radius, pattern=r'radius'
-                ),
-                CallbackQueryHandler(
-                    settings_convo_done, pattern=r'done'
-                )
+                CallbackQueryHandler(settings_convo_ask_location,
+                                     pattern=r'^location$'),
+                CallbackQueryHandler(settings_convo_ask_radius,
+                                     pattern=r'radius'),
+                CallbackQueryHandler(settings_convo_done, pattern=r'done')
             ],
-            SETTINGS_DONE: [
-                MessageHandler(Filters.text, settings_convo_done)
-            ]
+            SETTINGS_DONE: [MessageHandler(Filters.text, settings_convo_done)]
         },
-
-        fallbacks=[
-            MessageHandler(Filters.text, settings_convo_done)
-        ]
-    )
+        fallbacks=[MessageHandler(Filters.text, settings_convo_done)])
     disp.add_handler(settings_convo)
 
     disp.add_handler(CommandHandler('tilbud', offers_list))
@@ -518,23 +533,20 @@ def main():
             CommandHandler('slet', search_convo_ask_remove),
             CommandHandler('liste', search_convo_list)
         ],
-
         states={
             SEARCH_COMMAND: [
                 CallbackQueryHandler(search_convo_ask_query, pattern=r'^new$'),
-                CallbackQueryHandler(
-                    search_convo_ask_remove, pattern=r'^remove$'),
+                CallbackQueryHandler(search_convo_ask_remove,
+                                     pattern=r'^remove$'),
                 CallbackQueryHandler(search_convo_list, pattern=r'^list$')
             ],
-            SEARCH_ASK_QUERY: [
-                MessageHandler(Filters.text, search_convo_ask_query)
-            ],
-            SEARCH_ASK_PRICE: [
-                MessageHandler(Filters.text, search_convo_ask_price)
-            ],
+            SEARCH_ASK_QUERY:
+            [MessageHandler(Filters.text, search_convo_ask_query)],
+            SEARCH_ASK_PRICE:
+            [MessageHandler(Filters.text, search_convo_ask_price)],
             SEARCH_SHOW_RESULT: [
-                MessageHandler(Filters.regex(
-                    r'^[0-9]+(,|\.)?[0-9]*'), search_convo_show_result)
+                MessageHandler(Filters.regex(r'^[0-9]+(,|\.)?[0-9]*'),
+                               search_convo_show_result)
             ],
             SEARCH_DONE: [
                 CallbackQueryHandler(search_convo_ask_query, pattern=r'^new$'),
@@ -546,9 +558,7 @@ def main():
                 CallbackQueryHandler(search_convo_done, pattern='^ cancel$')
             ]
         },
-
-        fallbacks=[]
-    )
+        fallbacks=[])
     disp.add_handler(search_convo)
 
     # Start the Bot
